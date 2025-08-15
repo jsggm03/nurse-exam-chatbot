@@ -1,4 +1,0 @@
-streamlit
-openai
-scikit-learn
-pandas
