@@ -1,4 +1,5 @@
 streamlit
-openai
-scikit-learn
+openai>=1.30.0
 pandas
+numpy
+scikit-learn
