@@ -7,6 +7,9 @@ from collections import defaultdict
 from sklearn.metrics.pairwise import cosine_similarity
 from openai import OpenAI
 
+# ====================== 공통 설정 ======================
+st.set_page_config(page_title="간호사 상황극 문제은행", page_icon="🩺")
+
 # 🔐 OpenAI 키: 환경변수 우선 → 없으면 Streamlit secrets
 API_KEY = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY")
 if not API_KEY:
@@ -15,35 +18,100 @@ if not API_KEY:
 
 client = OpenAI(api_key=API_KEY)
 
-# 📥 CSV 불러오기
+# ====================== 데이터 로딩 ======================
 @st.cache_data
 def load_data():
-    df = pd.read_csv("nurse_1_with_embeddings.csv")
-    # Embedding 컬럼을 문자열 → 리스트로
-    df["Embedding"] = df["Embedding"].apply(ast.literal_eval)
-    return df
+    try:
+        df = pd.read_csv("nurse_1_with_embeddings.csv")
+    except FileNotFoundError:
+        st.error("CSV 파일 'nurse_1_with_embeddings.csv' 를 찾을 수 없습니다. 파일을 앱 루트에 업로드하세요.")
+        st.stop()
 
-def embed_text(text: str):
-    # 최신 임베딩 엔드포인트 사용
-    resp = client.embeddings.create(
-        model="text-embedding-3-small",  # 또는 "text-embedding-3-large"
-        input=[text]
-    )
+    if "Embedding" not in df.columns:
+        st.error("CSV에 'Embedding' 컬럼이 없습니다. 임베딩 컬럼명을 확인하세요.")
+        st.stop()
+
+    # Embedding 컬럼: 문자열 → 리스트
+    def to_list(x):
+        if isinstance(x, list):
+            return x
+        if isinstance(x, str):
+            try:
+                return ast.literal_eval(x)
+            except Exception:
+                return x
+        return x
+
+    df["Embedding"] = df["Embedding"].apply(to_list)
+
+    if len(df) == 0:
+        st.error("CSV가 비어 있습니다.")
+        st.stop()
+
+    first = df["Embedding"].iloc[0]
+    if not isinstance(first, (list, tuple)):
+        st.error("Embedding 컬럼이 리스트 형태가 아닙니다. 예: [0.1, 0.2, ...]")
+        st.stop()
+
+    embed_dim = len(first)
+
+    # 행별 길이 불일치 행 제거(있다면 경고)
+    bad = df["Embedding"].apply(lambda v: len(v) != embed_dim)
+    if bad.any():
+        st.warning(f"임베딩 길이가 다른 행 {bad.sum()}개를 발견했습니다. 해당 행은 제외합니다.")
+        df = df.loc[~bad].reset_index(drop=True)
+
+    return df, embed_dim
+
+# ====================== 임베딩/검색 함수 ======================
+def embed_text(text: str, target_dim: int):
+    """
+    CSV에 저장된 임베딩 차원(target_dim)에 맞춰 새 임베딩 생성.
+    - 1536: text-embedding-3-small (기본 1536)
+    - 3072: text-embedding-3-large (기본 3072)
+    - 기타: large + dimensions=target_dim 로 맞춤
+    """
+    if target_dim == 1536:
+        resp = client.embeddings.create(
+            model="text-embedding-3-small",
+            input=[text]
+        )
+    elif target_dim == 3072:
+        resp = client.embeddings.create(
+            model="text-embedding-3-large",
+            input=[text]
+        )
+    else:
+        resp = client.embeddings.create(
+            model="text-embedding-3-large",
+            input=[text],
+            dimensions=target_dim
+        )
     return resp.data[0].embedding
 
-def find_most_similar(user_embedding, df):
-    all_embeddings = np.array(df["Embedding"].to_list())
-    sims = cosine_similarity([user_embedding], all_embeddings)[0]
+def find_most_similar(user_embedding, df, target_dim: int):
+    # DataFrame → (N, D) float 행렬
+    all_embeddings = np.vstack(
+        df["Embedding"].apply(lambda v: np.asarray(v, dtype=np.float32))
+    )
+    user_embedding = np.asarray(user_embedding, dtype=np.float32).reshape(1, -1)
+
+    # 차원 가드
+    if all_embeddings.shape[1] != target_dim or user_embedding.shape[1] != target_dim:
+        raise ValueError(
+            f"임베딩 차원 불일치: CSV={all_embeddings.shape[1]}, QUERY={user_embedding.shape[1]}"
+        )
+
+    sims = cosine_similarity(user_embedding, all_embeddings)[0]
     best_idx = int(np.argmax(sims))
     return df.iloc[best_idx], float(sims[best_idx])
 
-# ========== Streamlit 시작 ==========
-st.set_page_config(page_title="간호사 상황극 문제은행", page_icon="🩺")
+# ====================== 앱 상태 초기화 ======================
 st.title("🩺 간호사 100문 100답 - 카테고리 선택 문제은행")
 
-# === 데이터 및 세션 초기화 ===
 if "raw_df" not in st.session_state:
-    st.session_state.raw_df = load_data()
+    st.session_state.raw_df, st.session_state.embed_dim = load_data()
+
 if "category_selected" not in st.session_state:
     st.session_state.category_selected = "전체"
 if "filtered_df" not in st.session_state:
@@ -61,9 +129,9 @@ if "category_stats" not in st.session_state:
 if "quiz_finished" not in st.session_state:
     st.session_state.quiz_finished = False
 
-# === 카테고리 필터 ===
+# ====================== 카테고리 필터 ======================
 all_categories = set()
-for etc in st.session_state.raw_df["Etc"]:
+for etc in st.session_state.raw_df.get("Etc", []):
     for e in str(etc).split(";"):
         e = e.strip()
         if e:
@@ -72,7 +140,7 @@ for etc in st.session_state.raw_df["Etc"]:
 category_options = ["전체"] + sorted(list(all_categories))
 selected = st.selectbox("📂 푸실 문제 카테고리를 선택하세요:", category_options)
 
-# 카테고리 변경 시 필터링
+# 카테고리 변경 시 필터링 & 상태 리셋
 if selected != st.session_state.category_selected:
     st.session_state.category_selected = selected
     if selected == "전체":
@@ -98,17 +166,30 @@ idx = st.session_state.current_idx
 if idx >= len(df):
     st.session_state.quiz_finished = True
 
-# ========== 문제 풀이 ==========
+# ====================== 문제 풀이 ======================
 if not st.session_state.quiz_finished:
     row = df.iloc[idx]
-    st.markdown(f"**문제 {idx + 1}:** {row['Question']}")
+
+    # 컬럼 이름 방어코드
+    q_col = "Question" if "Question" in df.columns else df.columns[0]
+    a_col = "Answer" if "Answer" in df.columns else df.columns[1]
+    e_col = "Etc" if "Etc" in df.columns else (df.columns[2] if len(df.columns) > 2 else None)
+
+    st.markdown(f"**문제 {idx + 1}:** {row[q_col]}")
     user_input = st.text_area("🧑‍⚕️ 당신의 간호사 응답은?", key=f"input_{idx}_{selected}")
 
-    if st.button("정답 제출") and user_input.strip():
+    col1, col2 = st.columns(2)
+    with col1:
+        submit_clicked = st.button("정답 제출", type="primary")
+    with col2:
+        next_clicked = st.button("다음 문제")
+
+    if submit_clicked and user_input.strip():
         with st.spinner("AI가 채점 중입니다..."):
             try:
-                user_embedding = embed_text(user_input)
-                best_match, similarity = find_most_similar(user_embedding, df)
+                # CSV 차원에 맞춘 임베딩 생성
+                user_embedding = embed_text(user_input, st.session_state.embed_dim)
+                best_match, similarity = find_most_similar(user_embedding, df, st.session_state.embed_dim)
 
                 st.session_state.total_count += 1
                 st.session_state.solved_ids.append(idx)
@@ -123,22 +204,26 @@ if not st.session_state.quiz_finished:
                 else:
                     st.error(f"❌ 오답입니다. 유사도 {similarity:.2f}")
 
-                st.markdown(f"**정답 예시:**\n> {best_match['Answer']}")
-                st.caption(f"🗂️ 카테고리: {str(best_match['Etc'])}")
+                st.markdown(f"**정답 예시:**\n> {best_match[a_col]}")
+                if e_col:
+                    st.caption(f"🗂️ 카테고리: {str(best_match[e_col])}")
 
-                for category in str(best_match["Etc"]).split(";"):
-                    category = category.strip()
-                    if category:
-                        st.session_state.category_stats[category]["total"] += 1
-                        if is_correct:
-                            st.session_state.category_stats[category]["correct"] += 1
+                # 카테고리 통계 집계
+                if e_col:
+                    for category in str(best_match[e_col]).split(";"):
+                        category = category.strip()
+                        if category:
+                            st.session_state.category_stats[category]["total"] += 1
+                            if is_correct:
+                                st.session_state.category_stats[category]["correct"] += 1
+
             except Exception as e:
                 st.error(f"채점 중 오류가 발생했습니다: {e}")
 
-    if st.button("다음 문제"):
+    if next_clicked:
         st.session_state.current_idx += 1
 
-# ========== 퀴즈 완료 ==========
+# ====================== 퀴즈 완료 ======================
 else:
     st.success("🎉 모든 문제를 완료했습니다!")
 
@@ -154,7 +239,6 @@ else:
 
     st.markdown("---")
     st.subheader("🧾 카테고리별 정답 통계")
-
     stats = st.session_state.category_stats
     for cat, stat in stats.items():
         if stat["total"] > 0:
@@ -166,4 +250,3 @@ else:
         for key in list(st.session_state.keys()):
             del st.session_state[key]
         st.experimental_rerun()
-
