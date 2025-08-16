@@ -55,7 +55,7 @@ def load_data():
 
     embed_dim = len(first)
 
-    # 행별 길이 불일치 행 제거(있다면 경고)
+    # 행별 길이 불일치 제거(있다면 경고)
     bad = df["Embedding"].apply(lambda v: len(v) != embed_dim)
     if bad.any():
         st.warning(f"임베딩 길이가 다른 행 {bad.sum()}개를 발견했습니다. 해당 행은 제외합니다.")
@@ -63,7 +63,7 @@ def load_data():
 
     return df, embed_dim
 
-# ====================== 임베딩/검색 함수 ======================
+# ====================== 임베딩 함수 ======================
 def embed_text(text: str, target_dim: int):
     """
     CSV에 저장된 임베딩 차원(target_dim)에 맞춰 새 임베딩 생성.
@@ -89,22 +89,31 @@ def embed_text(text: str, target_dim: int):
         )
     return resp.data[0].embedding
 
-def find_most_similar(user_embedding, df, target_dim: int):
-    # DataFrame → (N, D) float 행렬
-    all_embeddings = np.vstack(
-        df["Embedding"].apply(lambda v: np.asarray(v, dtype=np.float32))
-    )
-    user_embedding = np.asarray(user_embedding, dtype=np.float32).reshape(1, -1)
+# ====================== 채점(질문 단위) ======================
+def score_for_question(user_embedding, raw_df, current_row, target_dim, q_col, a_col):
+    """
+    사용자 답변 임베딩을 '현재 질문'의 정답(들)과만 비교.
+    - 같은 질문 텍스트가 여러 행에 있으면 모두 후보로 사용.
+    - 없을 경우 현재 행만 사용.
+    """
+    user = np.asarray(user_embedding, dtype=np.float32).reshape(1, -1)
 
-    # 차원 가드
-    if all_embeddings.shape[1] != target_dim or user_embedding.shape[1] != target_dim:
+    mask_same_q = raw_df[q_col].astype(str) == str(current_row[q_col])
+    subset = raw_df.loc[mask_same_q]
+
+    if subset.empty:
+        subset = pd.DataFrame([current_row])
+
+    cand_mat = np.vstack(subset["Embedding"].apply(lambda v: np.asarray(v, dtype=np.float32)))
+    if cand_mat.shape[1] != target_dim or user.shape[1] != target_dim:
         raise ValueError(
-            f"임베딩 차원 불일치: CSV={all_embeddings.shape[1]}, QUERY={user_embedding.shape[1]}"
+            f"임베딩 차원 불일치: CSV={cand_mat.shape[1]}, QUERY={user.shape[1]}"
         )
 
-    sims = cosine_similarity(user_embedding, all_embeddings)[0]
+    sims = cosine_similarity(user, cand_mat)[0]
     best_idx = int(np.argmax(sims))
-    return df.iloc[best_idx], float(sims[best_idx])
+    best_row = subset.iloc[best_idx]
+    return best_row, float(sims[best_idx])
 
 # ====================== 앱 상태 초기화 ======================
 st.title("🩺 간호사 100문 100답 - 카테고리 선택 문제은행")
@@ -172,8 +181,8 @@ if not st.session_state.quiz_finished:
 
     # 컬럼 이름 방어코드
     q_col = "Question" if "Question" in df.columns else df.columns[0]
-    a_col = "Answer" if "Answer" in df.columns else df.columns[1]
-    e_col = "Etc" if "Etc" in df.columns else (df.columns[2] if len(df.columns) > 2 else None)
+    a_col = "Answer"   if "Answer"   in df.columns else df.columns[1]
+    e_col = "Etc"      if "Etc"      in df.columns else (df.columns[2] if len(df.columns) > 2 else None)
 
     st.markdown(f"**문제 {idx + 1}:** {row[q_col]}")
     user_input = st.text_area("🧑‍⚕️ 당신의 간호사 응답은?", key=f"input_{idx}_{selected}")
@@ -187,9 +196,18 @@ if not st.session_state.quiz_finished:
     if submit_clicked and user_input.strip():
         with st.spinner("AI가 채점 중입니다..."):
             try:
-                # CSV 차원에 맞춘 임베딩 생성
+                # 1) 사용자 답변 임베딩(차원 자동 맞춤)
                 user_embedding = embed_text(user_input, st.session_state.embed_dim)
-                best_match, similarity = find_most_similar(user_embedding, df, st.session_state.embed_dim)
+
+                # 2) '현재 질문'의 정답(들)과만 비교
+                best_match, similarity = score_for_question(
+                    user_embedding,
+                    st.session_state.raw_df,  # 전체 원본에서 같은 질문 행을 모음
+                    row,
+                    st.session_state.embed_dim,
+                    q_col,
+                    a_col
+                )
 
                 st.session_state.total_count += 1
                 st.session_state.solved_ids.append(idx)
@@ -204,13 +222,14 @@ if not st.session_state.quiz_finished:
                 else:
                     st.error(f"❌ 오답입니다. 유사도 {similarity:.2f}")
 
+                # 항상 '현재 질문'의 정답 예시를 보여줌(동일 질문 중 가장 가까운 것)
                 st.markdown(f"**정답 예시:**\n> {best_match[a_col]}")
                 if e_col:
-                    st.caption(f"🗂️ 카테고리: {str(best_match[e_col])}")
+                    st.caption(f"🗂️ 카테고리: {str(row[e_col])}")  # 통계는 현재 문제의 카테고리 기준
 
-                # 카테고리 통계 집계
+                # 카테고리 통계 집계(현재 문제 기준)
                 if e_col:
-                    for category in str(best_match[e_col]).split(";"):
+                    for category in str(row[e_col]).split(";"):
                         category = category.strip()
                         if category:
                             st.session_state.category_stats[category]["total"] += 1
